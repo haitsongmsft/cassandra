@@ -253,10 +253,9 @@ public class StressSettings implements Serializable
             sb.append(arg);
             first = false;
         }
-        return sb.toString()
-                 .replaceAll("\\s+([,=()])", "$1")
-                 .replaceAll("([,=(])\\s+", "$1")
-                 .split(" +");
+        String sbStr = sb.toString().replaceAll("\\s+", " ");
+        String[] sbArr = sbStr.split(" +");
+        return sbArr; 
     }
 
     public static StressSettings get(Map<String, String[]> clArgs)

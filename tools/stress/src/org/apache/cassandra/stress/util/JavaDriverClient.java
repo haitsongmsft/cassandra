@@ -17,11 +17,20 @@
  */
 package org.apache.cassandra.stress.util;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.security.KeyStore;
+
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 
+import com.azure.cosmosdb.cassandra.util.Configurations;
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
 import com.datastax.driver.core.policies.LoadBalancingPolicy;
@@ -121,7 +130,11 @@ public class JavaDriverClient
 
     public void connect(ProtocolOptions.Compression compression) throws Exception
     {
-
+	   	if(host.contains("cosmosdb.azure.com")) {
+	  		this.session = this.getCosmosDbSession( host, port, username, password, null, null);
+    		return;
+	   	}
+	   	
         PoolingOptions poolingOpts = new PoolingOptions()
                                      .setConnectionsPerHost(HostDistance.LOCAL, connectionsPerHost, connectionsPerHost)
                                      .setMaxRequestsPerConnection(HostDistance.LOCAL, maxPendingPerConnection)
@@ -233,4 +246,155 @@ public class JavaDriverClient
     {
         cluster.close();
     }
+    
+    /**
+     * This method creates a Cassandra Session based on the the end-point details given in config.properties.
+     * This method validates the SSL certificate based on ssl_keystore_file_path & ssl_keystore_password properties.
+     * If ssl_keystore_file_path & ssl_keystore_password are not given then it uses 'cacerts' from JDK.
+     * @return Session Cassandra Session
+     */
+    public Session getCosmosDbSession(
+            String host,
+            int port,
+            String username,
+            String password,
+            String ssl_keystore_file_path,
+            String ssl_keystore_password) {
+
+        try {
+            //Load cassandra endpoint details from config.properties
+            File sslKeyStoreFile = loadCassandraConnectionDetails(ssl_keystore_file_path);
+            
+            String sslKeyStorePassword = "changeit";
+            sslKeyStorePassword = (ssl_keystore_password != null && !ssl_keystore_password.isEmpty()) ?
+                    ssl_keystore_password : sslKeyStorePassword;
+            
+            final KeyStore keyStore = KeyStore.getInstance("JKS");
+            try (final InputStream is = new FileInputStream(sslKeyStoreFile)) {
+                keyStore.load(is, sslKeyStorePassword.toCharArray());
+            }
+
+            final KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory
+                    .getDefaultAlgorithm());
+            kmf.init(keyStore, sslKeyStorePassword.toCharArray());
+            final TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory
+                    .getDefaultAlgorithm());
+            tmf.init(keyStore);
+
+            // Creates a socket factory for HttpsURLConnection using JKS contents.
+            final SSLContext sc = SSLContext.getInstance("TLSv1.2");
+            sc.init(kmf.getKeyManagers(), tmf.getTrustManagers(), new java.security.SecureRandom());
+
+            SSLOptions sslOptions = JdkSSLOptions.builder()
+                    .withSSLContext(sc)
+                    .withCipherSuites(encryptionOptions.cipher_suites).build();
+            
+            //JdkSSLOptions sslOptions = RemoteEndpointAwareJdkSSLOptions.builder()
+            //        .withSSLContext(sc)
+            //        .build();
+            
+            cluster = Cluster.builder()
+                    .addContactPoint(host)
+                    .withPort(port)
+                    .withCredentials(username, password)
+                    .withSSL(sslOptions)
+                    .build();
+
+            return cluster.connect();
+            
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+        return null;
+    }
+    
+    /**
+     * This method creates a Cassandra Session based on the the end-point details given in config.properties.
+     * This method validates the SSL certificate based on ssl_keystore_file_path & ssl_keystore_password properties.
+     * If ssl_keystore_file_path & ssl_keystore_password are not given then it uses 'cacerts' from JDK.
+     * @return Session Cassandra Session
+     */
+    private Session ___getCosmosDbSession(
+            String host,
+            int port,
+            String username,
+            String password,
+            String ssl_keystore_file_path,
+            String ssl_keystore_password) {
+
+        try {
+            //Load cassandra endpoint details from config.properties
+            File sslKeyStoreFile = loadCassandraConnectionDetails(ssl_keystore_file_path);
+            
+            String sslKeyStorePassword = "changeit";
+            sslKeyStorePassword = (ssl_keystore_password != null && !ssl_keystore_password.isEmpty()) ?
+                    ssl_keystore_password : sslKeyStorePassword;
+            
+            final KeyStore keyStore = KeyStore.getInstance("JKS");
+            try (final InputStream is = new FileInputStream(sslKeyStoreFile)) {
+                keyStore.load(is, sslKeyStorePassword.toCharArray());
+            }
+
+            final KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory
+                    .getDefaultAlgorithm());
+            kmf.init(keyStore, sslKeyStorePassword.toCharArray());
+            final TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory
+                    .getDefaultAlgorithm());
+            tmf.init(keyStore);
+
+            // Creates a socket factory for HttpsURLConnection using JKS contents.
+            final SSLContext sc = SSLContext.getInstance("TLSv1.2");
+            sc.init(kmf.getKeyManagers(), tmf.getTrustManagers(), new java.security.SecureRandom());
+
+            JdkSSLOptions sslOptions = RemoteEndpointAwareJdkSSLOptions.builder()
+                    .withSSLContext(sc)
+                    .build();
+            
+            cluster = Cluster.builder()
+                    .addContactPoint(host)
+                    .withPort(port)
+                    .withCredentials(username, password)
+                    .withSSL(sslOptions)
+                    .build();
+
+            return cluster.connect();
+            
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+        return null;
+    }
+    
+
+    /**
+     * Closes the cluster and Cassandra session
+     */
+    public void close() {
+        cluster.close();
+    }
+
+    /**
+     * Loads Cassandra end-point details from config.properties.
+     * @throws Exception
+     */
+    private File loadCassandraConnectionDetails(
+    		String ssl_keystore_file_path) throws Exception {
+
+        // If ssl_keystore_file_path, build the path using JAVA_HOME directory.
+        if (ssl_keystore_file_path == null || ssl_keystore_file_path.isEmpty()) {
+            String javaHomeDirectory = System.getenv("JAVA_HOME");
+            if (javaHomeDirectory == null || javaHomeDirectory.isEmpty()) {
+                throw new Exception("JAVA_HOME not set");
+            }
+            ssl_keystore_file_path = new StringBuilder(javaHomeDirectory).append("/jre/lib/security/cacerts").toString();
+        }
+
+        File sslKeyStoreFile = new File(ssl_keystore_file_path);
+
+        if (!sslKeyStoreFile.exists() || !sslKeyStoreFile.canRead()) {
+            throw new Exception(String.format("Unable to access the SSL Key Store file from %s", ssl_keystore_file_path));
+        }
+        
+        return sslKeyStoreFile;
+    }       
 }

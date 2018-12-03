@@ -185,7 +185,7 @@ public abstract class AbstractRow implements Row
                         };
                     }
                     sb.append(StreamSupport.stream(complexData.spliterator(), false)
-                                           .map(transform != null ? transform : cell -> "")
+                                           .map(transform)
                                            .collect(Collectors.joining(", ", "{", "}")));
                 }
             }
