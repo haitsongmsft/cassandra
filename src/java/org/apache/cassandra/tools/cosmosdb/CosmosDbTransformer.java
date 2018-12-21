@@ -31,6 +31,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -81,7 +83,9 @@ public final class CosmosDbTransformer
     private boolean rawTime = false;
 
     private long currentPosition = 0;
-
+    
+    private static CosmosIngester inj = new CosmosIngester();
+    
     private CosmosDbTransformer(ISSTableScanner currentScanner, boolean rawTime, CFMetaData metadata)
     {
         this.metadata = metadata;
@@ -89,15 +93,31 @@ public final class CosmosDbTransformer
         this.rawTime = rawTime;
     }
     
-    public static void toJson(
+    public static void IngestToCosmosDb(
     		ISSTableScanner currentScanner, 
     		Stream<UnfilteredRowIterator> partitions, 
     		boolean rawTime,
-    		CFMetaData metadata)
+    		CFMetaData metadata,
+    		String cqlCreateTable)
             throws IOException
     {
         CosmosDbTransformer transformer = new CosmosDbTransformer(currentScanner, rawTime, metadata);
-        partitions.forEach(transformer::serializePartition);
+
+        inj.addStatement(cqlCreateTable);
+                
+        ArrayList<Thread> threads = new ArrayList<Thread>();
+        for(int i=0; i<10; i++) { threads.add(new Thread(inj)); }
+        threads.forEach(t->t.start());
+        
+        partitions.forEach(part -> transformer.serializePartition(part));
+        
+    	threads.forEach(t->{
+			try {
+				t.join();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		});
     }
 
     private void updatePosition()
@@ -111,7 +131,8 @@ public final class CosmosDbTransformer
         char escape = asWhereClause? ' ': '"';
         char fieldEquals = asWhereClause? '=': ':';
         String splitter = asWhereClause? " and ": ",";
-        for(int i=0; i<fieldsAndValues.size(); i+=2) {
+        for(int i=0; i<fieldsAndValues.size(); i+=2) 
+        {
         	String fieldName = fieldsAndValues.get(i);
         	String fieldVal = fieldsAndValues.get(i+1);
             String fieldSeperator = sb.length()==0? "": splitter;
@@ -183,17 +204,19 @@ public final class CosmosDbTransformer
         return result;
     }
 
-    private void serializePartition(UnfilteredRowIterator partition)
+    private void serializePartition(UnfilteredRowIterator partition) 
     {
         try
         {           	
+            String tableName = metadata.ksName + "." + metadata.cfName;
             ArrayList<String> partitionKeyNameValues = serializePartitionKey(partition.partitionKey());
             if (!partition.partitionLevelDeletion().isLive()) 
             {
                 serializeDeletion(partition.partitionLevelDeletion());
                 // to do, delete based on partition
-                String partitionDelete = "delete from "+ metadata.cfName + " where " + this.assembleFields(partitionKeyNameValues, true);
+                String partitionDelete = "delete from "+ tableName + " where " + this.assembleFields(partitionKeyNameValues, true);
                 System.out.println(partitionDelete);
+                inj.addStatement(partitionDelete);
             }
             else 
             {
@@ -208,6 +231,7 @@ public final class CosmosDbTransformer
                 {
                     String rowStatement = serializeRow(partitionKeyNameValues, partition.staticRow());
                     System.out.println(rowStatement); 
+                    inj.addStatement(rowStatement);
                 }
 
                 Unfiltered unfiltered;
@@ -219,13 +243,15 @@ public final class CosmosDbTransformer
                     {
                         String rowStatement = serializeRow(partitionKeyNameValues, (Row) unfiltered);
                         System.out.println(rowStatement);
+                        inj.addStatement(rowStatement);
                     }
                     else if (unfiltered instanceof RangeTombstoneMarker)
                     {
                         String rangeStr = serializeTombstone((RangeTombstoneMarker) unfiltered);
-                        String rangeDelete= "delete from " + metadata.cfName + " where "+ 
+                        String rangeDelete= "delete from " + tableName + " where "+ 
                             this.assembleFields(partitionKeyNameValues, true) + " and " + rangeStr;
                         System.out.println(rangeDelete);
+                        inj.addStatement(rangeDelete);
                     }
                     updatePosition();
                 }
@@ -236,6 +262,7 @@ public final class CosmosDbTransformer
             String key = metadata.getKeyValidator().getString(partition.partitionKey().getKey());
             logger.error("Fatal error parsing partition: {}", key, e);
         }
+        inj.addStatement("");
     }
 
     private String serializeRow(List<String> partitionKeyValues, Row row)
@@ -272,14 +299,16 @@ public final class CosmosDbTransformer
         		result.add(colName);
         		result.add(colVal);
             }
+            
+            String tableName = metadata.ksName + "." + metadata.cfName;
                         
             if(!deleteOrExpired) 
             {
-                rowString = "insert into " + metadata.cfName + " JSON '{" + this.assembleFields(result, false) +"}'";
+                rowString = "insert into " + tableName + " JSON '{" + this.assembleFields(result, false) +"}'";
             }
             else 
             {
-                rowString = "delete from "+ metadata.cfName + " where "+ this.assembleFields(result, true); 
+                rowString = "delete from "+ tableName + " where "+ this.assembleFields(result, true); 
             }
         }
         catch (IOException e)
@@ -363,7 +392,7 @@ public final class CosmosDbTransformer
         return result;
     }
 
-    private String serializeDeletion(DeletionTime deletion) throws IOException
+	private String serializeDeletion(DeletionTime deletion) throws IOException
     {
     	return objMapper.writeValueAsString(new DeletionInfo(deletion));
     }

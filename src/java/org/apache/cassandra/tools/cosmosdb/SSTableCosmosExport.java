@@ -116,7 +116,6 @@ public class SSTableCosmosExport
                 });   
 
         cqlMeta.partitionKeyColumns().forEach(x -> builder.addPartitionKey(x.name, x.type));
-        // builder.addPartitionKey("PartitionKey", header.getKeyType());
                 
         for (int i = 0; i < header.getClusteringTypes().size(); i++)
         {
@@ -133,13 +132,14 @@ public class SSTableCosmosExport
         return StreamSupport.stream(splititer, false);
     }
 
-    private static CFMetaData readTableSchema(String sstableFolder, String keyspace) 
+    private static String readTableSchema(String sstableFolder) 
     {
     	try 
     	{
 	    	String fileName = sstableFolder+"/schema.cql";
 		    String data = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(fileName))); 
-		    return CFMetaData.compile(data, keyspace);
+		    System.out.println(data);
+		    return data;
     	}
     	catch(Exception e)
     	{
@@ -196,50 +196,42 @@ public class SSTableCosmosExport
         }
                 
         Descriptor desc = Descriptor.fromFilename(ssTableFileName);
-        CFMetaData cqlMeta = readTableSchema(ssTableFile.getParent(), desc.ksname);
         try
         {
+            String createQry = readTableSchema(ssTableFile.getParent());
+            CFMetaData cqlMeta = CFMetaData.compile(createQry,  desc.ksname);
             CFMetaData metadata = metadataFromSSTable(desc, cqlMeta);
-            if (cmd.hasOption(ENUMERATE_KEYS_OPTION))
+            SSTableReader sstable = SSTableReader.openNoValidation(desc, metadata);
+            IPartitioner partitioner =  sstable.getPartitioner();
+
+            final ISSTableScanner currentScanner;
+            if ((keys != null) && (keys.length > 0))
             {
-            	//XXXX enumerateKeys(desc, metadata);
+                List<AbstractBounds<PartitionPosition>> bounds = Arrays.stream(keys)
+                        .filter(key -> !excludes.contains(key))
+                        .map(metadata.getKeyValidator()::fromString)
+                        .map(partitioner::decorateKey)
+                        .sorted()
+                        .map(DecoratedKey::getToken)
+                        .map(token -> new Bounds<>(token.minKeyBound(), token.maxKeyBound())).collect(Collectors.toList());
+                currentScanner = sstable.getScanner(bounds.iterator());
             }
             else
             {
-                SSTableReader sstable = SSTableReader.openNoValidation(desc, metadata);
-                // IPartitioner partitioner =  sstable.getPartitioner();
-                IPartitioner partitioner = FBUtilities.newPartitioner(desc);  
-
-                final ISSTableScanner currentScanner;
-                if ((keys != null) && (keys.length > 0))
-                {
-                    List<AbstractBounds<PartitionPosition>> bounds = Arrays.stream(keys)
-                            .filter(key -> !excludes.contains(key))
-                            .map(metadata.getKeyValidator()::fromString)
-                            .map(partitioner::decorateKey)
-                            .sorted()
-                            .map(DecoratedKey::getToken)
-                            .map(token -> new Bounds<>(token.minKeyBound(), token.maxKeyBound())).collect(Collectors.toList());
-                    currentScanner = sstable.getScanner(bounds.iterator());
-                }
-                else
-                {
-                    currentScanner = sstable.getScanner();
-                }
-                Stream<UnfilteredRowIterator> partitions = iterToStream(currentScanner).filter(i ->
-                    excludes.isEmpty() || !excludes.contains(metadata.getKeyValidator().getString(i.partitionKey().getKey()))
-                );
-                
-                if (cmd.hasOption(DEBUG_OUTPUT_OPTION))
-                {
-                	printDebug(partitions, currentScanner, metadata);
-                }
-                else
-                {       
-                	// process records;
-                    CosmosDbTransformer.toJson(currentScanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata);
-                }                
+                currentScanner = sstable.getScanner();
             }
+            Stream<UnfilteredRowIterator> partitions = iterToStream(currentScanner).filter(i ->
+                excludes.isEmpty() || !excludes.contains(metadata.getKeyValidator().getString(i.partitionKey().getKey()))
+            );
+            
+            if (cmd.hasOption(DEBUG_OUTPUT_OPTION))
+            {
+            	printDebug(partitions, currentScanner, metadata);
+            }
+            else
+            {       
+                CosmosDbTransformer.IngestToCosmosDb(currentScanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata, createQry );
+            }                
         }
         catch (IOException e)
         {
