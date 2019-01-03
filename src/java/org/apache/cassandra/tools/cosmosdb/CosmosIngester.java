@@ -7,9 +7,15 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.security.*;
+import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import org.apache.cassandra.config.EncryptionOptions;
+import org.codehaus.jackson.JsonNode;
+import org.codehaus.jackson.map.JsonMappingException;
+import org.codehaus.jackson.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Cassandra utility class to handle the Cassandra Sessions
@@ -17,10 +23,12 @@ import org.apache.cassandra.config.EncryptionOptions;
 public class CosmosIngester implements Runnable
 {
 	
+    private static final Logger logger = LoggerFactory.getLogger(CosmosIngester.class);
     private Cluster cluster;
     private CosmosDbConfiguration config = new CosmosDbConfiguration();    
     private BlockingQueue<RetryQuery> queue = new ArrayBlockingQueue<RetryQuery>(6000);
     private BlockingQueue<RetryQuery> retryQueue = new ArrayBlockingQueue<RetryQuery>(600);
+    private BlockingQueue<Session> connectSession = new ArrayBlockingQueue<Session>(10);
 
     /**
      * This method creates a Cassandra Session based on the the end-point details given in config.properties.
@@ -28,16 +36,24 @@ public class CosmosIngester implements Runnable
      * If ssl_keystore_file_path & ssl_keystore_password are not given then it uses 'cacerts' from JDK.
      * @return Session Cassandra Session
      * @throws IOException 
+     * @throws InterruptedException 
      */
-    public Session getSession() throws IOException 
+    public Session getSession() throws IOException, InterruptedException 
     {
-        String host = config.getProperty("cassandra_host");
-        int port = Integer.parseInt(config.getProperty("cassandra_port"));
-        String user = config.getProperty("cassandra_username");
-        String pass = config.getProperty("cassandra_password");
-        String sslpath = config.getProperty("ssl_keystore_file_path");
-        String sslpass = config.getProperty("ssl_keystore_password");
-        return getCosmosDbSession(host, port, user, pass, sslpath,sslpass );
+    	if(connectSession.isEmpty()) 
+    	{
+            String host = config.getProperty("cassandra_host");
+            int port = Integer.parseInt(config.getProperty("cassandra_port"));
+            String user = config.getProperty("cassandra_username");
+            String pass = config.getProperty("cassandra_password");
+            String sslpath = config.getProperty("ssl_keystore_file_path");
+            String sslpass = config.getProperty("ssl_keystore_password");
+            return getCosmosDbSession(host, port, user, pass, sslpath,sslpass);    		
+    	}
+    	else 
+    	{
+    		return connectSession.take();
+    	}
     }
 
     public Cluster getCluster()
@@ -158,6 +174,7 @@ public class CosmosIngester implements Runnable
     		}
     		catch(Exception ex) 
     		{
+    			logger.error(ex.getMessage());
     		}
     	}	
     }
@@ -179,61 +196,133 @@ public class CosmosIngester implements Runnable
     	}
     }
 
-    public void executeStatement(String qry)
+    public void executeStatement(String qry) throws InterruptedException
     {
     	this.executeStatement(new RetryQuery(qry, 0));
     }
     
-    private void executeStatement(RetryQuery qry)
+    private void executeStatement(RetryQuery qry) throws InterruptedException
     {
+    	Session session = null;
     	try 
     	{
-    		Session session = this.getSession();
-    		session.execute(new SimpleStatement(qry.Qry));
+    		qry.Count++;
+    		session = this.getSession();
+    		session.execute(new SimpleStatement(qry.ToCqlQuery()));
+    		System.out.println("RETRY:" + qry.ToCqlQuery() + " Succeeded" + qry.Count);
     	}
     	catch(Exception ex)
     	{
+    		if(session!=null) 
+    		{
+     		    this.connectSession.put(session);
+    		}
     		if(qry.Count <5) 
     		{
-        		this.retryQueue.add(new RetryQuery(qry.Qry, qry.Count+1));    			
+        		this.retryQueue.add(qry);    			
     		}
     		else 
     		{
-    			System.err.println(qry.Qry + " failed: " + ex.getMessage());
+    			System.err.println(qry.ToCqlQuery() + " failed: " + ex.getMessage());
     		}
     	}
     }
     
-    private void executeInsertStatements(java.util.ArrayList<String> jsonStringBuilds, java.util.ArrayList<RetryQuery> qries)
+	private String GetFieldNameValueList(String baseInsertQuery, ObjectNode rowNode, ArrayList<Object> values)
     {
+    	StringBuilder names = new StringBuilder();
+    	StringBuilder bindPlaces = new StringBuilder();
+    	names.append(baseInsertQuery);
+    	names.append("(");
+    	int startLen = names.length();
+    	bindPlaces.append(" values (");
+    	rowNode.getFields().forEachRemaining(fv->{
+    		String fieldName = fv.getKey();
+    		String sep = names.length()>startLen ? ", ": "";
+    		JsonNode nodeValue = fv.getValue();
+    		if(nodeValue.isNull()) 
+    		{
+    		    values.add(null);
+    		}
+    		else if(nodeValue.isFloatingPointNumber())
+    		{
+    		    values.add(nodeValue.asDouble());    			
+    		}
+    		else if(nodeValue.isBigInteger()) 
+    		{
+    			values.add(nodeValue.asLong());
+    		}
+    		else if(nodeValue.isInt()) 
+    		{
+    			values.add(nodeValue.asInt());
+    		}
+    		else if(nodeValue.isBoolean()) 
+    		{
+    			values.add(nodeValue.asBoolean());
+    		}
+    		else if(nodeValue.isNumber()) 
+    		{
+    		    values.add(nodeValue.getNumberValue());
+    		}
+    		else 
+    		{
+        		String textNodeValue = nodeValue.asText();
+        		values.add(textNodeValue);
+    		}    		
+    		names.append(sep + fieldName);
+        	bindPlaces.append(sep + "?");
+    	});
+    	names.append(") ");
+    	bindPlaces.append(")    ");
+    	names.append(bindPlaces);
+    	return names.toString(); 
+    }
+    
+    private void executeInsertStatements( java.util.ArrayList<RetryQuery> queries) throws InterruptedException
+    {
+		java.util.ArrayList<Object> objValues = new java.util.ArrayList<Object>();
+		StringBuilder sb = new StringBuilder();
+		String newLine = System.getProperty("line.separator");
+		Session session = null;
     	try 
     	{    		
-    		Session session = this.getSession();
-    		StringBuilder sb = new StringBuilder();
-    		sb.append("BEGIN BATCH \n");
-    		jsonStringBuilds.forEach(x->sb.append("insert into quote.row_tests JSON (?); "));
-    		sb.append("APPLY BATCH \n");
-    		BatchStatement b = new BatchStatement();
-    		qries.forEach(q -> b.add(new SimpleStatement(q.Qry)));
-        	// PreparedStatement st = session.prepare();
-    		// BoundStatement bd = st.bind(jsonStringBuilds);
-    		session.execute(b);
+    		session = this.getSession();
+    		sb.append("BEGIN UNLOGGED BATCH ");
+    		sb.append(newLine);
+    		queries.forEach(x->{
+    		   String sqry = this.GetFieldNameValueList(x.Qry, x.rowNode, objValues);
+    		   sb.append(sqry);
+               sb.append(newLine);
+    		});
+    		sb.append("APPLY BATCH;");
+            sb.append(newLine);
+        	PreparedStatement st = session.prepare(sb.toString());
+    		BoundStatement bd = st.bind(objValues.toArray());
+    	    ResultSet response = session.execute(bd);
+            if (response != null && response.getAllExecutionInfo() != null)
+            {
+            }
+            logger.info("Inserted: " + queries.size());
     	}
     	catch(Exception ex)
     	{
-    		this.retryQueue.addAll(qries);
+    		if(session!=null) 
+    		{
+    			this.connectSession.put(session);
+    		}
+    		System.err.println(ex.getMessage());
+    		this.retryQueue.addAll(queries);
     	}
     }
     
-    private synchronized int createAndExecuteBatch()
-    		throws InterruptedException, IOException
+    private synchronized int createAndExecuteBatch() throws InterruptedException, IOException
     {
     	
 		java.util.ArrayList<RetryQuery> qryStatements = new java.util.ArrayList<RetryQuery>();
-		java.util.ArrayList<String> jsonStringBuilds = new java.util.ArrayList<String>();
-				
+		
     	int nMaxBatchSize = 100;
     	int isEndingBatch = 0;
+    	String nonInsertQry = null;
     	
     	for(int i=0; i<nMaxBatchSize; i++)
     	{
@@ -252,74 +341,69 @@ public class CosmosIngester implements Runnable
 			char batchType = qry.charAt(0); 
 			if(batchType=='i') 
 			{
-				jsonStringBuilds.add(qry.substring(32));
-				qryStatements.add(new RetryQuery(qry, query.Count + 1));
+				qryStatements.add(query);
 			}
 			else 
 			{
-				executeStatement(query);
+				nonInsertQry = qry;
+				break;
 			}
     	}
     	
     	// build an insert batch:    	
-    	if(jsonStringBuilds.size() > 0) 
+    	if(qryStatements.size() > 0) 
     	{
-    		this.executeInsertStatements(jsonStringBuilds, qryStatements);
+    		this.executeInsertStatements(qryStatements);
     	}
+    	
+    	// execute other query;
+    	if(nonInsertQry!=null) 
+    	{
+    		executeStatement(nonInsertQry);
+    	} 
     	
     	return isEndingBatch;
     }
-    
-    /*
-                
-    private synchronized BatchStatement createBatch() 
-    		throws InterruptedException
-    {
-    	int nMaxBatchSize = 100;
-    	BatchStatement batch = new BatchStatement(); 
-    	char batchType = 0;
-    	
-    	for(int i=0; i<nMaxBatchSize; i++)
-    	{
-    		if(queue.isEmpty() && batch.size() >0 )
-    		{
-    			return batch;
-    		}
-        	String qry = queue.take();
-    		if(qry.length()==0 || ( qry.charAt(0) != batchType && batchType>0 ))
-    		{
-    			queue.put(qry); // put back, so as to all other thread will quit
-    			return batch;
-    		}
-    		else 
-    		{
-    			// we want to build batch in the same type, all inserts go together
-    			batchType = qry.charAt(0); 
-    		    batch.add(new SimpleStatement(qry));
-    		}
-    	}
-    	return batch;
-    }
-     */
         
     public void addStatement(String statement)
     {
     	try 
     	{
+            logger.info("adding statement: /" + statement + "/");
     		queue.put(new RetryQuery(statement,0));    		
     	}
     	catch(InterruptedException ex) 
     	{
     		// eat and retry;
-    		System.err.println("Failed to queue statement: " + statement );
+    		logger.error("Failed to queue statement: " + statement );
     	}
+    }
+    
+    // add a record for bulk inserts.
+    public void addInsertRow(String insertTableStatement, ObjectNode rowNode)
+    {
+    	this.queue.add(new RetryQuery(insertTableStatement, rowNode));
     }
     
     private class RetryQuery
     {
     	String Qry;
+    	ObjectNode rowNode;
     	int Count;
-    	RetryQuery(String q, int c) { this.Qry = q; this.Count =c; }
-    }
-    
+    	RetryQuery(String q, int c, ObjectNode rowNode) { this.Qry = q; this.Count =c; this.rowNode = rowNode; }
+    	RetryQuery(String q, ObjectNode rowNode) { this(q,0,rowNode); }
+    	RetryQuery(String q, int c) { this(q,c,null); }
+    	RetryQuery(String q) { this(q, 0); }
+    	
+    	public String ToCqlQuery() 
+    	{
+    		if(this.rowNode !=null && Qry.startsWith("i")) 
+    		{
+                String insertRowAsJson = this.Qry + " JSON '{" + CosmosDbTransformer.assembleFields(rowNode, false) +"}'";
+    			return insertRowAsJson;
+    		}
+    		return Qry;
+    	}
+    	
+    }    
 }

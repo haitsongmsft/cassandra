@@ -48,8 +48,12 @@ import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.codehaus.jackson.JsonGenerationException;
+import org.codehaus.jackson.JsonNode;
+import org.codehaus.jackson.JsonProcessingException;
+import org.codehaus.jackson.JsonToken;
 import org.codehaus.jackson.map.*;
 import org.codehaus.jackson.node.ArrayNode;
+import org.codehaus.jackson.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -68,7 +72,7 @@ public final class CosmosDbTransformer
 
     private long currentPosition = 0;
     
-    private static CosmosIngester inj = new CosmosIngester();
+    private CosmosIngester inj = new CosmosIngester();
     
     private CosmosDbTransformer(ISSTableScanner currentScanner, boolean rawTime, CFMetaData metadata)
     {
@@ -83,17 +87,17 @@ public final class CosmosDbTransformer
     		boolean rawTime,
     		CFMetaData metadata,
     		String cqlCreateTable)
-            throws IOException
+            throws IOException, InterruptedException
     {
         CosmosDbTransformer transformer = new CosmosDbTransformer(currentScanner, rawTime, metadata);
-        inj.executeStatement(cqlCreateTable);
+        transformer.inj.executeStatement(cqlCreateTable);
                 
         ArrayList<Thread> threads = new ArrayList<Thread>();
-        for(int i=0; i<10; i++) { threads.add(new Thread(inj)); }
+        for(int i=0; i<10; i++) { threads.add(new Thread(transformer.inj)); }
         threads.forEach(t->t.start());
         
         partitions.forEach(part -> transformer.serializePartition(part));
-        inj.addStatement("");
+        transformer.inj.addStatement("");
         
     	threads.forEach(t->{
 			try {
@@ -108,25 +112,9 @@ public final class CosmosDbTransformer
     {
         this.currentPosition = currentScanner.getCurrentPosition();
     }
-    
-    private String assembleFields(List<String> fieldsAndValues, boolean asWhereClause)
-    {
-    	StringBuilder sb = new StringBuilder();
-        char escape = asWhereClause? ' ': '"';
-        char fieldEquals = asWhereClause? '=': ':';
-        String splitter = asWhereClause? " and ": ",";
-        for(int i=0; i<fieldsAndValues.size(); i+=2) 
-        {
-        	String fieldName = fieldsAndValues.get(i);
-        	String fieldVal = fieldsAndValues.get(i+1);
-            String fieldSeperator = sb.length()==0? "": splitter;
-            sb.append(fieldSeperator + escape + fieldName + escape + fieldEquals + fieldVal);
-        }
-        return sb.toString();
-    }
-
+            
     // returns a where clause for partitioning key;
-    private ArrayList<String> serializePartitionKey(DecoratedKey key)
+    private ArrayList<String> serializePartitionKey(DecoratedKey key, ObjectNode rowNode)
     {    
     	ArrayList<String> result = new ArrayList<String>();
         AbstractType<?> keyValidator = metadata.getKeyValidator();
@@ -155,12 +143,14 @@ public final class CosmosDbTransformer
 
                     ByteBuffer value = ByteBufferUtil.readBytesWithShortLength(keyBytes);
                     String colVal = colType.getString(value);
+                    String colJsonVal = colType.toJSONString(value, ProtocolVersion.CURRENT);
 
                     ColumnDefinition cdef = colDefs.get(iCol++);
                     String colName = cdef.name.toCQLString(); 
                     
                     result.add(colName);
                     result.add(colVal);
+                    this.putJsonValue(colName, colJsonVal, rowNode);
 
                     byte b = keyBytes.get();
                     if (b != 0)
@@ -176,9 +166,12 @@ public final class CosmosDbTransformer
                 assert metadata.partitionKeyColumns().size() == 1;
             	ColumnDefinition cdef = metadata.partitionKeyColumns().get(0);
                 String colName = cdef.name.toCQLString();
-            	String colVal = keyValidator.getString(key.getKey());
+                ByteBuffer value = key.getKey();
+            	String colVal = keyValidator.getString(value);
+                String colJsonVal = cdef.cellValueType().toJSONString(value, ProtocolVersion.CURRENT);
                 result.add(colName);
                 result.add(colVal);
+                this.putJsonValue(colName, colJsonVal, rowNode);
             }
         }
         catch (Exception e)
@@ -193,19 +186,19 @@ public final class CosmosDbTransformer
         try
         {           	
             String tableName = metadata.ksName + "." + metadata.cfName;
-            ArrayList<String> partitionKeyNameValues = serializePartitionKey(partition.partitionKey());
+            ObjectNode partitionKeyNode = this.objMapper.createObjectNode();
+            serializePartitionKey(partition.partitionKey(), partitionKeyNode);
             if (!partition.partitionLevelDeletion().isLive()) 
             {
                 serializeDeletion(partition.partitionLevelDeletion());
                 // to do, delete based on partition
-                String partitionDelete = "delete from "+ tableName + " where " + this.assembleFields(partitionKeyNameValues, true);
-                System.out.println(partitionDelete);
+                String partitionDelete = "delete from "+ tableName + " where " + this.assembleFields(partitionKeyNode, true);
                 inj.addStatement(partitionDelete);
             }
             else 
             {
                 // info only:
-                System.out.println("Partition: table "+ this.assembleFields(partitionKeyNameValues, false));            	
+                System.out.println("Partition: table "+ this.assembleFields(partitionKeyNode, false));            	
             }
 
             if (partition.hasNext() || partition.staticRow() != null)
@@ -215,9 +208,7 @@ public final class CosmosDbTransformer
                 
                 if (!partition.staticRow().isEmpty())
                 {
-                    String rowStatement = serializeRow(partitionKeyNameValues, partition.staticRow());
-                    System.out.println(rowStatement); 
-                    inj.addStatement(rowStatement);
+                    serializeRow(partitionKeyNode, partition.staticRow());
                 }
 
                 Unfiltered unfiltered;
@@ -228,16 +219,13 @@ public final class CosmosDbTransformer
                     unfiltered = partition.next();
                     if (unfiltered instanceof Row)
                     {
-                        String rowStatement = serializeRow(partitionKeyNameValues, (Row) unfiltered);
-                        System.out.println(rowStatement);
-                        inj.addStatement(rowStatement);
+                        serializeRow(partitionKeyNode, (Row) unfiltered);
                     }
                     else if (unfiltered instanceof RangeTombstoneMarker)
                     {
                         String rangeStr = serializeTombstone((RangeTombstoneMarker) unfiltered);
                         String rangeDelete= "delete from " + tableName + " where "+ 
-                            this.assembleFields(partitionKeyNameValues, true) + " and " + rangeStr;
-                        System.out.println(rangeDelete);
+                            this.assembleFields(partitionKeyNode, true) + " and " + rangeStr;
                         inj.addStatement(rangeDelete);
                     }
                     updatePosition();
@@ -251,22 +239,22 @@ public final class CosmosDbTransformer
         }
     }
 
-    private String serializeRow(List<String> partitionKeyValues, Row row)
+    private void serializeRow(ObjectNode partitionKeyNode, Row row)
     {
-    	// ObjectNode rowNode = this.objMapper.createObjectNode();
-    	String rowString=null;
-    	ArrayList<String> result = new ArrayList<String>();
         try
         {
-            result.addAll(partitionKeyValues);
+        	
+    		ObjectNode rowNode = objMapper.createObjectNode();
+    		
+    		// clone partition key info to row.
+    		partitionKeyNode.getFields().forEachRemaining(fv->{ rowNode.put(fv.getKey(), fv.getValue()); });
         	
             LivenessInfo liveInfo = row.primaryKeyLivenessInfo();
             ExpirationInfo expInfo = new ExpirationInfo(liveInfo);
             
             boolean deleteOrExpired = !row.deletion().isLive() || expInfo.expired;
-            
-            ArrayList<String> clusterKeyValues = serializeClustering(row.clustering());
-            result.addAll(clusterKeyValues);
+                		
+            serializeClustering(row.clustering(), rowNode);
             
             for (ColumnData cd : row)
             {      
@@ -278,27 +266,29 @@ public final class CosmosDbTransformer
         			// we don't care fields if the row is deleted, only keys are needed.
         			continue;
         		}
-                String colVal = serializeColumnData(cd, liveInfo);
-        		result.add(colName);
-        		result.add(colVal);
+                String colVal = serializeColumnData(cd, liveInfo, rowNode);
+        		// result.add(colName);
+        		// result.add(colVal);
             }
             
             String tableName = metadata.ksName + "." + metadata.cfName;
                         
             if(!deleteOrExpired) 
             {
-                rowString = "insert into " + tableName + " JSON '{" + this.assembleFields(result, false) +"}'";
+                String insertRowAsJson = "insert into " + tableName + " JSON '{" + this.assembleFields(rowNode, false) +"}'";
+                logger.debug(insertRowAsJson);
+                this.inj.addInsertRow("insert into "+ tableName, rowNode);
             }
             else 
             {
-                rowString = "delete from "+ tableName + " where "+ this.assembleFields(result, true); 
+                String rowString = "delete from "+ tableName + " where "+ this.assembleFields(rowNode, true); 
+                this.inj.addStatement(rowString);
             }
         }
         catch (IOException e)
         {
             logger.error("Fatal error parsing row.", e);
         }
-        return rowString;
     }
 
     private String serializeTombstone(RangeTombstoneMarker tombstone)
@@ -357,7 +347,7 @@ public final class CosmosDbTransformer
     }
     
     // serialize for json format clustering info via adding to rowNode.
-    private ArrayList<String> serializeClustering(ClusteringPrefix clustering) throws IOException
+    private ArrayList<String> serializeClustering(ClusteringPrefix clustering, ObjectNode rowNode) throws IOException
     {
     	ArrayList<String> result = new ArrayList<String>();
         List<ColumnDefinition> clusteringColumns = metadata.clusteringColumns();
@@ -368,6 +358,7 @@ public final class CosmosDbTransformer
         	String cellVal = column.cellValueType().toJSONString(clustering.get(i), ProtocolVersion.CURRENT);
         	result.add(colName);
         	result.add(cellVal);
+        	this.putJsonValue(colName, cellVal, rowNode);
         }
         return result;
     }
@@ -377,7 +368,7 @@ public final class CosmosDbTransformer
     	return objMapper.writeValueAsString(new DeletionInfo(deletion));
     }
 
-    private String serializeColumnData(ColumnData cd, LivenessInfo liveInfo) 
+    private String serializeColumnData(ColumnData cd, LivenessInfo liveInfo, ObjectNode rowNode) 
     		throws JsonGenerationException, JsonMappingException, IOException
     {
     	ColumnDefinition cdef = cd.column();
@@ -385,7 +376,7 @@ public final class CosmosDbTransformer
         String colName = cd.column().name.toCQLString();        
         if (cdef.isSimple())
         {
-            return serializeCell((Cell) cd, liveInfo);
+            return serializeCell((Cell) cd, liveInfo, rowNode);
         }
         else
         {
@@ -393,26 +384,32 @@ public final class CosmosDbTransformer
             if (!complexData.complexDeletion().isLive())
             {
             	// as a delete, the delete info is not recorded in cosmosdb
-                return " null ";
+                // return " null ";
+            	rowNode.putNull(colName);
+            	return " null "; // JSON format null, this will be used in insert statement cql string.
             }
             else 
             {
-            	StringBuilder sb = new StringBuilder();    	
-            	sb.append("{");
-	            for (Cell cell : complexData)
+            	ObjectNode cellNode = rowNode.putObject(colName); // create a cell node to attach to row.
+            	//StringBuilder sb = new StringBuilder();    	
+            	//sb.append("{");
+	            for (Cell subCell : complexData)
 	            {
-	            	String celName = cell.column().name.toCQLString();
-	                String celVal = serializeCell(cell, liveInfo);
-	                sb.append(sb.length()>1? "," : "");
-	                sb.append("\""+celName+"\" : "+ celVal);
-	            }
-            	sb.append("}");
-	            return sb.toString();
+	            	String celName = subCell.column().name.toCQLString();
+	                String celVal = serializeCell(subCell, liveInfo, cellNode);
+	                //sb.append(sb.length()>1? "," : "");
+	                //sb.append("\""+celName+"\" : "+ celVal);
+	            }	            
+            	// sb.append("}");
+	            // return sb.toString();
+	            String jsonValStr = objMapper.writerWithDefaultPrettyPrinter().writeValueAsString(cellNode);
+	            return jsonValStr;
             }
        }            
     }
         
-    private String serializeCell(Cell cell, LivenessInfo liveInfo) 
+    // returns a json value of the cell, and assemble the rowNode with the cell's content.
+    private String serializeCell(Cell cell, LivenessInfo liveInfo, ObjectNode rowNode) 
     		throws JsonGenerationException, JsonMappingException, IOException 
     {
         String cellValue = null;
@@ -432,7 +429,7 @@ public final class CosmosDbTransformer
                 arrNode.add(cellArrItem);
             }
             cellValue = objMapper.writerWithDefaultPrettyPrinter().writeValueAsString(arrNode);
-            // rowNode.put(colName, arrNode);   
+            rowNode.put(colName, arrNode);   
             cellType = cell.column().cellValueType();
         }
         else if (type.isUDT() && type.isMultiCell()) // non-frozen udt
@@ -446,7 +443,7 @@ public final class CosmosDbTransformer
                 arrNode.add(cellArrItem);
             }
             cellValue = objMapper.writerWithDefaultPrettyPrinter().writeValueAsString(arrNode);
-            // rowNode.put(colName, arrNode);                           
+            rowNode.put(colName, arrNode);                           
             Short fieldPosition = ((UserType) type).nameComparator().compose(cell.path().get(0));
             cellType = ((UserType) type).fieldType(fieldPosition);
         }
@@ -456,8 +453,8 @@ public final class CosmosDbTransformer
         }
         if (cell.isTombstone())
         {
-        	cellValue = " null ";
-        	// rowNode.putNull(colName);
+        	cellValue = " null "; // cql and json value of null
+        	rowNode.putNull(colName);
         	//NOCOSMOSDBSUPPORT:
             //json.writeFieldName("deletion_info");
             //objectIndenter.setCompact(true);
@@ -471,6 +468,7 @@ public final class CosmosDbTransformer
         {
             // json.writeRawValue(cellType.toJSONString(cell.value(), ProtocolVersion.CURRENT));            	
         	cellValue = cellType.toJSONString(cell.value(), ProtocolVersion.CURRENT);
+        	this.putJsonValue(colName, cellValue, rowNode); 
         }
         // NOT supported in cosmosdb: cell level info info if cell timestamp:
         if (liveInfo.isEmpty() || cell.timestamp() != liveInfo.timestamp())
@@ -485,7 +483,7 @@ public final class CosmosDbTransformer
         	if(expired) 
         	{
         		cellValue= " null ";
-        		// rowNode.putNull(colName);
+        		rowNode.putNull(colName);
         	}
         	//NOCOSMOSDBSUPPORT:
         	String expiresAt = dateString(TimeUnit.SECONDS, cell.localDeletionTime());
@@ -505,5 +503,42 @@ public final class CosmosDbTransformer
         long offset = Math.floorMod(from.toNanos(time), 1000_000_000L); // nanos per sec
         return Instant.ofEpochSecond(secs, offset).toString();
     }
-
+    
+    // method to assemble a field of json value format to the row node.
+    private void putJsonValue(String fieldName, String jsonValue, ObjectNode rowNode) 
+    		throws JsonProcessingException, IOException
+    {
+        JsonNode jsNode = objMapper.readTree("{\""+ fieldName +"\": "+jsonValue +"}");
+        JsonNode jsValue = jsNode.get(fieldName);
+        rowNode.put(fieldName, jsValue);
+    }
+    
+    public static String assembleFields(ObjectNode rowNode, boolean asWhereClause)
+    {
+    	StringBuilder sb = new StringBuilder();
+        char escape = asWhereClause? ' ': '"';
+        char fieldEquals = asWhereClause? '=': ':';
+        String splitter = asWhereClause? " and ": ",";
+        rowNode.getFields().forEachRemaining(fv -> 
+        {
+        	String fieldName = fv.getKey();
+        	JsonNode fieldValue = fv.getValue();
+        	String fieldVal = getJsonString(fieldValue);
+            String fieldSeperator = sb.length()==0? "": splitter;
+            sb.append(fieldSeperator + escape + fieldName + escape + fieldEquals + fieldVal);
+        });
+        return sb.toString();
+    }    
+    
+    public static String getJsonString(JsonNode jsnode)
+    {
+		try {
+			return objMapper.writeValueAsString(jsnode);
+		} catch (IOException e) {
+			logger.error("FATAL ERROR");
+			logger.error(e.getMessage());
+			System.exit(1);
+		}
+		return null;
+    }        
 }

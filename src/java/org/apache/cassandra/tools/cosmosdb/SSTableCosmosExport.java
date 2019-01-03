@@ -236,8 +236,10 @@ public class SSTableCosmosExport
         }
         catch (IOException e)
         {
-            // throwing exception outside main with broken pipe causes windows cmd to hang
-            e.printStackTrace(System.err);
+        	
+        }
+        catch (InterruptedException e)
+        {
         }
 
         System.exit(0);
