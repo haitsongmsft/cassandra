@@ -20,19 +20,11 @@
  */
 package org.apache.cassandra.tools.cosmosdb;
 
-import java.io.ByteArrayOutputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -53,19 +45,11 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
-import org.apache.cassandra.tools.JsonTransformer;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.codehaus.jackson.JsonFactory;
 import org.codehaus.jackson.JsonGenerationException;
-import org.codehaus.jackson.JsonGenerator;
-import org.codehaus.jackson.JsonNode;
-import org.codehaus.jackson.impl.Indenter;
 import org.codehaus.jackson.map.*;
 import org.codehaus.jackson.node.ArrayNode;
-import org.codehaus.jackson.node.ObjectNode;
-import org.codehaus.jackson.util.DefaultPrettyPrinter;
-import org.codehaus.jackson.util.DefaultPrettyPrinter.NopIndenter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -102,14 +86,14 @@ public final class CosmosDbTransformer
             throws IOException
     {
         CosmosDbTransformer transformer = new CosmosDbTransformer(currentScanner, rawTime, metadata);
-
-        inj.addStatement(cqlCreateTable);
+        inj.executeStatement(cqlCreateTable);
                 
         ArrayList<Thread> threads = new ArrayList<Thread>();
         for(int i=0; i<10; i++) { threads.add(new Thread(inj)); }
         threads.forEach(t->t.start());
         
         partitions.forEach(part -> transformer.serializePartition(part));
+        inj.addStatement("");
         
     	threads.forEach(t->{
 			try {
@@ -227,6 +211,8 @@ public final class CosmosDbTransformer
             if (partition.hasNext() || partition.staticRow() != null)
             {
                 updatePosition();
+                System.out.println("position: " + this.currentPosition);  
+                
                 if (!partition.staticRow().isEmpty())
                 {
                     String rowStatement = serializeRow(partitionKeyNameValues, partition.staticRow());
@@ -236,6 +222,7 @@ public final class CosmosDbTransformer
 
                 Unfiltered unfiltered;
                 updatePosition();
+                
                 while (partition.hasNext())
                 {
                     unfiltered = partition.next();
@@ -262,11 +249,11 @@ public final class CosmosDbTransformer
             String key = metadata.getKeyValidator().getString(partition.partitionKey().getKey());
             logger.error("Fatal error parsing partition: {}", key, e);
         }
-        inj.addStatement("");
     }
 
     private String serializeRow(List<String> partitionKeyValues, Row row)
     {
+    	// ObjectNode rowNode = this.objMapper.createObjectNode();
     	String rowString=null;
     	ArrayList<String> result = new ArrayList<String>();
         try
@@ -277,10 +264,6 @@ public final class CosmosDbTransformer
             ExpirationInfo expInfo = new ExpirationInfo(liveInfo);
             
             boolean deleteOrExpired = !row.deletion().isLive() || expInfo.expired;
-            StringBuilder sb = new StringBuilder();
-            char escape = deleteOrExpired? ' ': '"';
-            char fieldEquals = deleteOrExpired? '=': ':';
-            String splitter = deleteOrExpired? " and ": ",";
             
             ArrayList<String> clusterKeyValues = serializeClustering(row.clustering());
             result.addAll(clusterKeyValues);
@@ -346,34 +329,31 @@ public final class CosmosDbTransformer
     		operator = bound.isStart() ? ">" : "<";
     		operator += bound.isInclusive() ? "=" : "";
     	}
-    	
-        String fieldNameList = serializeClusteringForCQL(bound.clustering(), true);
-        String fieldValList = serializeClusteringForCQL(bound.clustering(), false);
-        return fieldNameList + operator + fieldValList;
+
+    	StringBuilder sbFieldNames = new StringBuilder();
+    	StringBuilder sbFieldValues = new StringBuilder();
+        serializeClusteringForCQL(bound.clustering(), sbFieldNames, sbFieldValues);
+        return sbFieldNames.toString() + operator + sbFieldValues.toString();
     }
         
-    private String serializeClusteringForCQL(ClusteringPrefix clustering, boolean returnNameField)
+    private void serializeClusteringForCQL(ClusteringPrefix clustering, StringBuilder fieldNames, StringBuilder fieldValues)
     {   
-    	StringBuilder sb = new StringBuilder();
-    	sb.append("(");
+    	fieldNames.append("(");
+    	fieldValues.append("(");
         List<ColumnDefinition> clusteringColumns = metadata.clusteringColumns();
         for (int i = 0; i < clusteringColumns.size() && i < clustering.size(); i++)
         {
-        	sb.append(i>0? ",": "");
+        	String sep = i>0? ",": "";
+        	fieldNames.append(sep);
+        	fieldValues.append(sep);
             ColumnDefinition column = clusteringColumns.get(i);
-        	if(returnNameField) 
-        	{
-        		String colName = column.name.toCQLString();
-            	sb.append(colName);
-        	}
-        	else 
-        	{
-	            String cellVal = column.cellValueType().toJSONString(clustering.get(i), ProtocolVersion.CURRENT);
-            	sb.append(cellVal);
-        	}
+    		String colName = column.name.toCQLString();
+        	fieldNames.append(colName);
+            String cellVal = column.cellValueType().toJSONString(clustering.get(i), ProtocolVersion.CURRENT);
+        	fieldValues.append(cellVal);
         }
-    	sb.append(")");
-        return sb.toString();
+    	fieldNames.append(")");
+    	fieldValues.append(")");
     }
     
     // serialize for json format clustering info via adding to rowNode.
@@ -436,7 +416,6 @@ public final class CosmosDbTransformer
     		throws JsonGenerationException, JsonMappingException, IOException 
     {
         String cellValue = null;
-        
     	ColumnDefinition cdef = cell.column();
         AbstractType<?> type = cdef.type;
         AbstractType<?> cellType = null;

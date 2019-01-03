@@ -119,7 +119,7 @@ public class SSTableCosmosExport
                 
         for (int i = 0; i < header.getClusteringTypes().size(); i++)
         {
-        	String colName = cqlMeta.clusteringColumns().get(i).name.toCQLString();
+            String colName = cqlMeta.clusteringColumns().get(i).name.toCQLString();
             builder.addClusteringColumn(colName, header.getClusteringTypes().get(i));
         }
         
@@ -136,14 +136,15 @@ public class SSTableCosmosExport
     {
     	try 
     	{
-	    	String fileName = sstableFolder+"/schema.cql";
-		    String data = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(fileName))); 
-		    System.out.println(data);
-		    return data;
+	        String fileName = sstableFolder+"/schema.cql";
+            String data = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(fileName))); 
+            System.out.println(data);
+            return data;
     	}
     	catch(Exception e)
     	{
-    		return null;
+            System.out.println("Unable to find the schema of the snapshot dump" + e.getMessage());
+            return null;
     	}
     }
     

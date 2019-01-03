@@ -7,7 +7,6 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.security.*;
-import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import org.apache.cassandra.config.EncryptionOptions;
@@ -20,7 +19,8 @@ public class CosmosIngester implements Runnable
 	
     private Cluster cluster;
     private CosmosDbConfiguration config = new CosmosDbConfiguration();    
-    private BlockingQueue<String> queue = new ArrayBlockingQueue<String>(6000);
+    private BlockingQueue<RetryQuery> queue = new ArrayBlockingQueue<RetryQuery>(6000);
+    private BlockingQueue<RetryQuery> retryQueue = new ArrayBlockingQueue<RetryQuery>(600);
 
     /**
      * This method creates a Cassandra Session based on the the end-point details given in config.properties.
@@ -134,82 +134,143 @@ public class CosmosIngester implements Runnable
         }
         return null;
     }
-    
-    private String GetBatchQueryContent(BatchStatement batch) 
-    {
-    	if(batch==null) return null;
-    	StringBuilder sb = new StringBuilder();
-    	for(Statement st : batch.getStatements()) 
-    	{
-    		sb.append(st.toString());
-    		sb.append("\n");
-    	}    	
-    	return sb.toString();
-    }
-        
+            
     public void run()
+    {
+		int batchEnds = 0;
+    	while(true) 
+    	{
+    		try 
+    		{
+    			if(batchEnds <0 && this.retryQueue.isEmpty()) 
+    			{
+    				return;
+    			}
+    			
+    			if(this.retryQueue.isEmpty())
+    			{
+    				batchEnds = createAndExecuteBatch();
+    			}    			
+    			else
+    			{
+    				this.retryStatements();
+    			}	        	
+    		}
+    		catch(Exception ex) 
+    		{
+    		}
+    	}	
+    }
+    
+    private void retryStatements()
     {
     	try 
     	{
-    		int maxRetries = 1;
-    	    int startInterval = 5000;
-    		int numRetries = 0;
-    		int sleepInterval = startInterval;
-    		BatchStatement batch = null;
-	    	while(true) 
-	    	{
-	    		try 
-	    		{
-	    			
-	    			if(batch==null) 
-	    			{
-	    				batch = createBatch();
-	    			}
-	    			
-		        	if(batch.size()==0)
-		        	{
-		        		return;
-		        	}
-	            	else 
-	            	{
-				    	Session session = this.getSession();
-				    	for(Statement st : batch.getStatements()) {
-				    		System.out.println(">>["+numRetries+"]: "+st.toString());
-				    	    session.execute(st);
-				    		System.out.println("<<["+numRetries+"]: "+st.toString());
-				    	}
-	            		/*
-				    	ResultSetFuture res = session.executeAsync(batch);
-			    		System.out.println(">>["+numRetries+"]: "+ this.GetBatchQueryContent(batch));
-				    	ResultSet resx =res.get();
-			    		System.out.println("<<["+numRetries+"]: "+ this.GetBatchQueryContent(batch));
-				    	*/
-				    	batch =  null;
-	            	}
-	    		}
-	    		catch(Exception ex) 
-	    		{
-	    			// retry batch;
-	    			if(++numRetries>maxRetries) 
-	    			{
-	    				System.err.println("BatchError: " + ex.getMessage());
-	    				System.err.println("FailedBatch: " + this.GetBatchQueryContent(batch));
-	    				numRetries = 0;
-	    				sleepInterval = startInterval;
-				    	batch =  null;
-	    			}
-	    			else 
-	    			{
-	    				Thread.sleep(sleepInterval);
-	    				sleepInterval *=2;
-	    			}
-	    		}
-	    	}
+		    int startInterval = 5000;
+			if(!this.retryQueue.isEmpty())
+			{
+				RetryQuery qry = this.retryQueue.take();
+				Thread.sleep(qry.Count*startInterval);
+				this.executeStatement(qry);
+			}
     	}
-    	catch(InterruptedException e) 
-    	{    		
+    	catch(InterruptedException ex) 
+    	{
     	}
     }
+
+    public void executeStatement(String qry)
+    {
+    	this.executeStatement(new RetryQuery(qry, 0));
+    }
+    
+    private void executeStatement(RetryQuery qry)
+    {
+    	try 
+    	{
+    		Session session = this.getSession();
+    		session.execute(new SimpleStatement(qry.Qry));
+    	}
+    	catch(Exception ex)
+    	{
+    		if(qry.Count <5) 
+    		{
+        		this.retryQueue.add(new RetryQuery(qry.Qry, qry.Count+1));    			
+    		}
+    		else 
+    		{
+    			System.err.println(qry.Qry + " failed: " + ex.getMessage());
+    		}
+    	}
+    }
+    
+    private void executeInsertStatements(java.util.ArrayList<String> jsonStringBuilds, java.util.ArrayList<RetryQuery> qries)
+    {
+    	try 
+    	{    		
+    		Session session = this.getSession();
+    		StringBuilder sb = new StringBuilder();
+    		sb.append("BEGIN BATCH \n");
+    		jsonStringBuilds.forEach(x->sb.append("insert into quote.row_tests JSON (?); "));
+    		sb.append("APPLY BATCH \n");
+    		BatchStatement b = new BatchStatement();
+    		qries.forEach(q -> b.add(new SimpleStatement(q.Qry)));
+        	// PreparedStatement st = session.prepare();
+    		// BoundStatement bd = st.bind(jsonStringBuilds);
+    		session.execute(b);
+    	}
+    	catch(Exception ex)
+    	{
+    		this.retryQueue.addAll(qries);
+    	}
+    }
+    
+    private synchronized int createAndExecuteBatch()
+    		throws InterruptedException, IOException
+    {
+    	
+		java.util.ArrayList<RetryQuery> qryStatements = new java.util.ArrayList<RetryQuery>();
+		java.util.ArrayList<String> jsonStringBuilds = new java.util.ArrayList<String>();
+				
+    	int nMaxBatchSize = 100;
+    	int isEndingBatch = 0;
+    	
+    	for(int i=0; i<nMaxBatchSize; i++)
+    	{
+    		
+    		RetryQuery query = queue.take();    		
+    		if(query.Qry.length()==0)
+    		{
+    			queue.put(query); // put back, so as to all other thread will quit
+    			isEndingBatch = -1;
+    			break;
+    		}
+    		
+    		String qry = query.Qry;
+    		
+			// we want to build batch in the same type, all inserts go together
+			char batchType = qry.charAt(0); 
+			if(batchType=='i') 
+			{
+				jsonStringBuilds.add(qry.substring(32));
+				qryStatements.add(new RetryQuery(qry, query.Count + 1));
+			}
+			else 
+			{
+				executeStatement(query);
+			}
+    	}
+    	
+    	// build an insert batch:    	
+    	if(jsonStringBuilds.size() > 0) 
+    	{
+    		this.executeInsertStatements(jsonStringBuilds, qryStatements);
+    	}
+    	
+    	return isEndingBatch;
+    }
+    
+    /*
                 
     private synchronized BatchStatement createBatch() 
     		throws InterruptedException
@@ -225,7 +286,7 @@ public class CosmosIngester implements Runnable
     			return batch;
     		}
         	String qry = queue.take();
-    		if(qry.length()==0 || (qry.charAt(0) != batchType && batchType>0))
+    		if(qry.length()==0 || ( qry.charAt(0) != batchType && batchType>0 ))
     		{
     			queue.put(qry); // put back, so as to all other thread will quit
     			return batch;
@@ -239,12 +300,13 @@ public class CosmosIngester implements Runnable
     	}
     	return batch;
     }
+     */
         
     public void addStatement(String statement)
     {
     	try 
     	{
-    		queue.put(statement);    		
+    		queue.put(new RetryQuery(statement,0));    		
     	}
     	catch(InterruptedException ex) 
     	{
@@ -252,4 +314,12 @@ public class CosmosIngester implements Runnable
     		System.err.println("Failed to queue statement: " + statement );
     	}
     }
+    
+    private class RetryQuery
+    {
+    	String Qry;
+    	int Count;
+    	RetryQuery(String q, int c) { this.Qry = q; this.Count =c; }
+    }
+    
 }
