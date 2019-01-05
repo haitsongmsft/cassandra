@@ -231,7 +231,11 @@ public class SSTableCosmosExport
             }
             else
             {       
-                CosmosIngester.GetInstance().executeStatement(createQry);        
+                //TODOTODO: create schema didn't support gc_grace_seconds = 864000
+            	// create table before data copy
+            	CosmosIngester ing = new CosmosIngester();
+            	ing.executeStatement(createQry);   
+            	// serialize partitions:
             	CosmosDbTransformer.IngestToCosmosDb(currentScanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata);
             }                
         }

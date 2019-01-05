@@ -193,17 +193,18 @@ public final class CosmosDbTransformer
                 // to do, delete based on partition
                 String partitionDelete = "delete from "+ tableName + " where " + assembleFields(partitionKeyNode, true);
                 partionIngester.addStatement(partitionDelete);
+                logger.debug("PARTITIONDELETE: {}", partitionDelete);
             }
             else 
             {
                 // info only:
-                System.out.println("Partition: table "+ assembleFields(partitionKeyNode, false));            	
+            	logger.debug("Partition: table "+ assembleFields(partitionKeyNode, false)); 
             }
 
             if (partition.hasNext() || partition.staticRow() != null)
             {
                 updatePosition();
-                System.out.println("position: " + this.currentPosition);  
+                logger.debug("position: " + this.currentPosition);  
                 
                 if (!partition.staticRow().isEmpty())
                 {
@@ -226,6 +227,7 @@ public final class CosmosDbTransformer
                         String rangeDelete= "delete from " + tableName + " where "+ 
                             assembleFields(partitionKeyNode, true) + " and " + rangeStr;
                         partionIngester.addStatement(rangeDelete);
+                        logger.debug("RANGEDELETE: {}", rangeDelete);
                     }
                     updatePosition();
                 }
@@ -269,7 +271,7 @@ public final class CosmosDbTransformer
         		boolean isKey= cdef.isPrimaryKeyColumn() || cdef.isClusteringColumn() || cdef.isPrimaryKeyColumn();
         		if(deleteOrExpired && !isKey) 
         		{
-        			// we don't care fields if the row is deleted, only keys are needed.
+        			// we don't care fields if the row is deleted, only keys are needed for making deletes
         			continue;
         		}
                 serializeColumnData(cd, liveInfo, rowNode); // String colVal = , colName = cdef.name.toCQLString();
@@ -352,20 +354,16 @@ public final class CosmosDbTransformer
     }
     
     // serialize for json format clustering info via adding to rowNode.
-    private ArrayList<String> serializeClustering(ClusteringPrefix clustering, ObjectNode rowNode) throws IOException
+    private void serializeClustering(ClusteringPrefix clustering, ObjectNode rowNode) throws IOException
     {
-    	ArrayList<String> result = new ArrayList<String>();
         List<ColumnDefinition> clusteringColumns = metadata.clusteringColumns();
         for (int i = 0; i < clusteringColumns.size() && i< clustering.size(); i++)
         {
             ColumnDefinition column = clusteringColumns.get(i);
             String colName = column.name.toCQLString();
         	String cellVal = column.cellValueType().toJSONString(clustering.get(i), ProtocolVersion.CURRENT);
-        	result.add(colName);
-        	result.add(cellVal);
         	this.putJsonValue(colName, cellVal, rowNode);
         }
-        return result;
     }
 
 	private String serializeDeletion(DeletionTime deletion) throws IOException

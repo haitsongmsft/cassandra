@@ -1,9 +1,6 @@
 package org.apache.cassandra.tools.cosmosdb;
 
 import com.datastax.driver.core.*;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.MoreExecutors;
 
 import javax.net.ssl.*;
 import java.io.File;
@@ -13,15 +10,8 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.security.*;
 import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 import org.apache.cassandra.config.EncryptionOptions;
 import org.codehaus.jackson.JsonNode;
@@ -36,8 +26,8 @@ public class CosmosIngester implements Runnable
 {
     private static final Logger logger = LoggerFactory.getLogger(CosmosIngester.class);
 	private static final int RETRYINTERVAL = 2000; // miliseconds;
-	private static final int MAXRETRIES = 4;
-	private static final int NTHREADS = 10;
+	private static final int MAXRETRIES = 3;
+	private static final int NTHREADS = 4;
     private static BlockingQueue<Session> connectSession = null;
     private static BlockingQueue<CosmosIngester> ingesters = null;
     private static Cluster cluster =  null;
@@ -95,7 +85,9 @@ public class CosmosIngester implements Runnable
     			ingesters.add(inj);
     		}
     	}
-    	return ingesters.take();
+    	inj = ingesters.take();
+    	inj.clear();
+    	return inj;
     }
     
     public static boolean SaveInstance(CosmosIngester ing)
@@ -212,11 +204,17 @@ public class CosmosIngester implements Runnable
     	}
     	cluster.close();
     }
+    
+    private void clear()
+    {
+    	isEnding = false; // before fresh run, clean up
+    	preparedInsertQry = null; // fresh run, clean up
+    	retryQueue.clear();
+    	queue.clear();
+    }
             
     public void run()
     {
-    	isEnding = false; // fresh run, clean up
-    	preparedInsertQry = null; // fresh run, clean up
     	while( !isKilled )
     	{
     		try 
@@ -248,14 +246,8 @@ public class CosmosIngester implements Runnable
 			if(!this.retryQueue.isEmpty())
 			{
 				RetryQuery qry = this.retryQueue.take();
-				if(!qry.isMaxOut()) 
-				{
-					this.executeStatement(qry);
-				}
-				else 
-				{
-					this.retryQueue.put(qry);
-				}
+	    		qry.SleepOnRetry();
+				this.executeStatement(qry);
 			}
     	}
     	catch(InterruptedException ex) 
@@ -277,17 +269,18 @@ public class CosmosIngester implements Runnable
     		qry.Count++;	
     		session = getSession();
     		session.execute(new SimpleStatement(qry.ToCqlQuery()));
-    		System.out.println("RETRY:" + qry.ToCqlQuery() + " Succeeded after " + qry.Count + " retries");
+    		logger.debug("EXECUTESUCESS@{}: {}", qry.Count, qry.ToCqlQuery());
     	}
     	catch(Exception ex)
     	{
-    		if(!qry.isMaxOut())
+    		if(qry.Count<= MAXRETRIES)
     		{
-        		this.retryQueue.add(qry);    			
+	    		this.retryQueue.add(qry);    			
+	    		logger.error("RETRYFAIL@{}: {} {}", qry.Count, qry.ToCqlQuery(), ex.getMessage());
     		}
-    		else 
+    		else
     		{
-    			System.err.println(qry.ToCqlQuery() + " failed: " + ex.getMessage());
+        		logger.warn("RETRYWARN@{}: {} {}",  qry.Count, qry.ToCqlQuery(), ex.getMessage());
     		}
     	}
     	finally
@@ -296,24 +289,27 @@ public class CosmosIngester implements Runnable
     	}
     }
             
-	/* insert by bulk 
-    private void executeInsertBatch( java.util.ArrayList<RetryQuery> queries) throws InterruptedException
+	/* insert by bulk using unlogged batch with ensuring the partition keys are the same across records */
+    private void executePreparedUnloggedBatch( ArrayList<RetryQuery> queries) 
+    		throws InterruptedException
     {
-		java.util.ArrayList<Object> objValues = new java.util.ArrayList<Object>();
+		ArrayList<Object> objValues = new ArrayList<Object>();
 		StringBuilder sb = new StringBuilder();
 		String newLine = System.getProperty("line.separator");
+ 	    String insertQry = null; 
 		Session session = null;
     	try 
     	{    		
     		session = getSession();
     		sb.append("BEGIN UNLOGGED BATCH ");
     		sb.append(newLine);
-    		queries.forEach(x->{
-    		   String sqry = GetInsertPrepareStatement(x.Qry, x.rowNode);
-    		   objValues.addAll(GetStatementBindValues(x.rowNode));
-    		   sb.append(sqry);
+    		for(RetryQuery x: queries)
+    		{
+    		   insertQry = insertQry == null? GetInsertPrepareStatement(x.Qry, x.rowNode): insertQry;
+    		   sb.append(insertQry);
                sb.append(newLine);
-    		});
+     		   objValues.addAll(GetStatementBindValues(x.rowNode));
+    		};
     		sb.append("APPLY BATCH;");
             sb.append(newLine);
         	PreparedStatement st = session.prepare(sb.toString());
@@ -327,23 +323,64 @@ public class CosmosIngester implements Runnable
     	}
     	catch(Exception ex)
     	{
-    		if(session!=null) 
-    		{
-    			connectSession.put(session);
-    		}
     		System.err.println(ex.getMessage());
     		this.retryQueue.addAll(queries);
     	}
+    	finally
+    	{
+    		SaveSession(session);
+    	}
     }
-    */
-    
+
+    private void executeJsonUnloggedBatch( ArrayList<RetryQuery> queries) 
+    		throws InterruptedException
+    {
+		StringBuilder sb = new StringBuilder();
+		String newLine = System.getProperty("line.separator");
+		Session session = null;
+    	try 
+    	{    		
+    		session = getSession();
+    		// we are safe to use unlogged batch as we are in same partition keys
+    		// the method below directly uses JSON as input, which requires server
+    		// to parse JSON. vs the above uses one layer of column name broke down 
+    		// and it does NOT seem to have major difference.
+    		sb.append("BEGIN UNLOGGED BATCH "); 
+    		sb.append(newLine);
+    		for(RetryQuery x: queries)
+    		{
+    			sb.append(x.ToCqlQuery());
+        		sb.append(newLine);
+    		};
+    		sb.append("APPLY BATCH;");
+            sb.append(newLine);
+    	    ResultSet resultSet = session.execute(sb.toString());
+    	    ExecutionInfo exc = resultSet.getExecutionInfo();
+    	    java.util.Map<String, ByteBuffer> incomingPayLoad = exc.getIncomingPayload();
+    	    ByteBuffer valueInBytes = incomingPayLoad.get("RequestCharge");
+    	    double requestUnits = valueInBytes.asDoubleBuffer().get();
+            logger.info("Inserted: " + queries.size() + " CosmosDb Request Units: " + requestUnits);
+    	}
+    	catch(Exception ex)
+    	{
+    		System.err.println(ex.getMessage());
+    		this.retryQueue.addAll(queries);
+    	}
+    	finally
+    	{
+    		SaveSession(session);
+    	}
+    }
+        
     private PreparedStatement preparedInsertQry = null;
     
 	/*************************************************************************************************************** 
 	 * insert by prepared statements, it is said to be more efficient than previous ones due to time saved in parsing
+	 * however, due to the ingester is going to live within a partition, so the unlogged batch could work faster.
 	 * https://medium.com/@foundev/cassandra-batch-loading-without-the-batch-the-nuanced-edition-dd78d61e9885
-	 ***************************************************************************************************************/
-    private void executeInsertStatements( java.util.ArrayList<RetryQuery> queries) throws InterruptedException
+	 ***************************************************************************************************************
+    */
+    private void executePreparedInsertStatements( java.util.ArrayList<RetryQuery> queries) throws InterruptedException
     {
 		Session session = null;
     	try 
@@ -352,10 +389,10 @@ public class CosmosIngester implements Runnable
     		ArrayList<ResultSetFuture> resList = new ArrayList<ResultSetFuture>();
     		for(RetryQuery x : queries)
     		{
-	            String spqry = GetInsertPrepareStatement(x.Qry, x.rowNode);
 	            ArrayList<Object> objValues = GetStatementBindValues(x.rowNode);
 	            if(null == preparedInsertQry) 
 	            {
+		            String spqry = GetInsertPrepareStatement(x.Qry, x.rowNode);
 	            	preparedInsertQry = session.prepare(spqry); 
 	            }
 	    		BoundStatement bd = preparedInsertQry.bind(objValues.toArray());
@@ -368,11 +405,6 @@ public class CosmosIngester implements Runnable
         	    java.util.Map<String, ByteBuffer> incomingPayLoad = exc.getIncomingPayload();
         	    ByteBuffer valueInBytes = incomingPayLoad.get("RequestCharge");
         	    double requestUnits = valueInBytes.asDoubleBuffer().get();
-        	    List<String> columnNames = 
-        	    	      resultSet.getColumnDefinitions().asList().stream()
-        	    	      .map(cl -> cl.getName())
-        	    	      .collect(Collectors.toList());
-        	    columnNames.forEach(xx->{ System.out.println(xx.toString()); }); 
                 logger.info(" CosmosDb Request Units: " + requestUnits);
     		});    		
     		logger.info( "Inserted: " + queries.size());
@@ -416,7 +448,11 @@ public class CosmosIngester implements Runnable
     	// build an insert batch:    	
     	if(qryStatements.size() > 0) 
     	{
-    		this.executeInsertStatements(qryStatements);
+    		/* these 2 unlogged batch showed same RU consumption*/
+    		// this.executePreparedUnloggedBatch(qryStatements);
+    		this.executeJsonUnloggedBatch(qryStatements);
+    		// 
+    		// this.executePreparedInsertStatements(qryStatements);
     	}
     	
     	// execute other query;
@@ -528,20 +564,15 @@ public class CosmosIngester implements Runnable
     		this.rowNode = rowNode;
     	}
     	
-    	boolean isMaxOut()
+    	void SleepOnRetry()
     	{
     		try 
     		{
-	    		if( Count> MAXRETRIES )
-	    		{
-	    			return true;
-	    		}
-				Thread.sleep( this.Count*RETRYINTERVAL+1000 );
-    		}
-    		catch(Exception ex)
-			{		
+    			Thread.sleep( this.Count*RETRYINTERVAL+1000 );			
 			}
-			return false;
+    		catch(Exception ex)
+			{			
+			}
     	}
     	
     	RetryQuery(String q, ObjectNode rowNode) { this(q,0,rowNode); }
