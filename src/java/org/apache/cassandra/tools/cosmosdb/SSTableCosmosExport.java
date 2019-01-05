@@ -231,7 +231,8 @@ public class SSTableCosmosExport
             }
             else
             {       
-                CosmosDbTransformer.IngestToCosmosDb(currentScanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata, createQry );
+                CosmosIngester.GetInstance().executeStatement(createQry);        
+            	CosmosDbTransformer.IngestToCosmosDb(currentScanner, partitions, cmd.hasOption(RAW_TIMESTAMPS), metadata);
             }                
         }
         catch (IOException e)

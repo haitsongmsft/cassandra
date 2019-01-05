@@ -50,7 +50,6 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.codehaus.jackson.JsonGenerationException;
 import org.codehaus.jackson.JsonNode;
 import org.codehaus.jackson.JsonProcessingException;
-import org.codehaus.jackson.JsonToken;
 import org.codehaus.jackson.map.*;
 import org.codehaus.jackson.node.ArrayNode;
 import org.codehaus.jackson.node.ObjectNode;
@@ -71,9 +70,7 @@ public final class CosmosDbTransformer
     private boolean rawTime = false;
 
     private long currentPosition = 0;
-    
-    private CosmosIngester inj = new CosmosIngester();
-    
+        
     private CosmosDbTransformer(ISSTableScanner currentScanner, boolean rawTime, CFMetaData metadata)
     {
         this.metadata = metadata;
@@ -85,27 +82,22 @@ public final class CosmosDbTransformer
     		ISSTableScanner currentScanner, 
     		Stream<UnfilteredRowIterator> partitions, 
     		boolean rawTime,
-    		CFMetaData metadata,
-    		String cqlCreateTable)
+    		CFMetaData metadata)
             throws IOException, InterruptedException
     {
         CosmosDbTransformer transformer = new CosmosDbTransformer(currentScanner, rawTime, metadata);
-        transformer.inj.executeStatement(cqlCreateTable);
-                
-        ArrayList<Thread> threads = new ArrayList<Thread>();
-        for(int i=0; i<10; i++) { threads.add(new Thread(transformer.inj)); }
-        threads.forEach(t->t.start());
-        
-        partitions.forEach(part -> transformer.serializePartition(part));
-        transformer.inj.addStatement("");
-        
-    	threads.forEach(t->{
-			try {
-				t.join();
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
-		});
+        partitions.forEach(part ->{
+        	try 
+        	{
+        		transformer.serializePartition(part);
+        	}
+        	catch(InterruptedException ex)
+        	{
+        		// eat exception;
+        	}
+        });
+        CosmosIngester.Close();    	
+    	logger.info("Ingest of table " + metadata.cfName+ " finished ");
     }
 
     private void updatePosition()
@@ -181,24 +173,31 @@ public final class CosmosDbTransformer
         return result;
     }
 
-    private void serializePartition(UnfilteredRowIterator partition) 
+    private void serializePartition(UnfilteredRowIterator partition) throws InterruptedException 
     {
+    	CosmosIngester partionIngester = null;
+    	Thread partionIngThread = null;
         try
         {           	
             String tableName = metadata.ksName + "." + metadata.cfName;
-            ObjectNode partitionKeyNode = this.objMapper.createObjectNode();
+            ObjectNode partitionKeyNode = objMapper.createObjectNode();            
             serializePartitionKey(partition.partitionKey(), partitionKeyNode);
+
+            partionIngester = CosmosIngester.GetInstance();
+            partionIngThread = new Thread(partionIngester);
+            partionIngThread.start();
+                                                           
             if (!partition.partitionLevelDeletion().isLive()) 
             {
                 serializeDeletion(partition.partitionLevelDeletion());
                 // to do, delete based on partition
-                String partitionDelete = "delete from "+ tableName + " where " + this.assembleFields(partitionKeyNode, true);
-                inj.addStatement(partitionDelete);
+                String partitionDelete = "delete from "+ tableName + " where " + assembleFields(partitionKeyNode, true);
+                partionIngester.addStatement(partitionDelete);
             }
             else 
             {
                 // info only:
-                System.out.println("Partition: table "+ this.assembleFields(partitionKeyNode, false));            	
+                System.out.println("Partition: table "+ assembleFields(partitionKeyNode, false));            	
             }
 
             if (partition.hasNext() || partition.staticRow() != null)
@@ -208,7 +207,7 @@ public final class CosmosDbTransformer
                 
                 if (!partition.staticRow().isEmpty())
                 {
-                    serializeRow(partitionKeyNode, partition.staticRow());
+                    serializeRow(partitionKeyNode, partition.staticRow(), partionIngester);
                 }
 
                 Unfiltered unfiltered;
@@ -219,14 +218,14 @@ public final class CosmosDbTransformer
                     unfiltered = partition.next();
                     if (unfiltered instanceof Row)
                     {
-                        serializeRow(partitionKeyNode, (Row) unfiltered);
+                        serializeRow(partitionKeyNode, (Row) unfiltered, partionIngester);
                     }
                     else if (unfiltered instanceof RangeTombstoneMarker)
                     {
                         String rangeStr = serializeTombstone((RangeTombstoneMarker) unfiltered);
                         String rangeDelete= "delete from " + tableName + " where "+ 
-                            this.assembleFields(partitionKeyNode, true) + " and " + rangeStr;
-                        inj.addStatement(rangeDelete);
+                            assembleFields(partitionKeyNode, true) + " and " + rangeStr;
+                        partionIngester.addStatement(rangeDelete);
                     }
                     updatePosition();
                 }
@@ -237,13 +236,21 @@ public final class CosmosDbTransformer
             String key = metadata.getKeyValidator().getString(partition.partitionKey().getKey());
             logger.error("Fatal error parsing partition: {}", key, e);
         }
+        finally
+        {
+            if(partionIngester!=null) 
+            {
+                partionIngester.end();
+                partionIngThread.join();
+    		    CosmosIngester.SaveInstance(partionIngester);
+            }
+        }
     }
 
-    private void serializeRow(ObjectNode partitionKeyNode, Row row)
+    private void serializeRow(ObjectNode partitionKeyNode, Row row, CosmosIngester partionIngester) throws InterruptedException
     {
         try
-        {
-        	
+        {        	
     		ObjectNode rowNode = objMapper.createObjectNode();
     		
     		// clone partition key info to row.
@@ -259,30 +266,28 @@ public final class CosmosDbTransformer
             for (ColumnData cd : row)
             {      
             	ColumnDefinition cdef = cd.column();
-                String colName = cdef.name.toCQLString();
         		boolean isKey= cdef.isPrimaryKeyColumn() || cdef.isClusteringColumn() || cdef.isPrimaryKeyColumn();
         		if(deleteOrExpired && !isKey) 
         		{
         			// we don't care fields if the row is deleted, only keys are needed.
         			continue;
         		}
-                String colVal = serializeColumnData(cd, liveInfo, rowNode);
-        		// result.add(colName);
-        		// result.add(colVal);
+                serializeColumnData(cd, liveInfo, rowNode); // String colVal = , colName = cdef.name.toCQLString();
             }
             
             String tableName = metadata.ksName + "." + metadata.cfName;
                         
             if(!deleteOrExpired) 
             {
-                String insertRowAsJson = "insert into " + tableName + " JSON '{" + this.assembleFields(rowNode, false) +"}'";
-                logger.debug(insertRowAsJson);
-                this.inj.addInsertRow("insert into "+ tableName, rowNode);
+                String insertRowAsJson = "insert into " + tableName + " JSON '{" + assembleFields(rowNode, false) +"}'";
+                logger.debug("RECORDINSERT : " + insertRowAsJson);
+                partionIngester.addInsertRow("insert into "+ tableName, rowNode);
             }
             else 
             {
-                String rowString = "delete from "+ tableName + " where "+ this.assembleFields(rowNode, true); 
-                this.inj.addStatement(rowString);
+                String deleteRowQuery = "delete from "+ tableName + " where "+ assembleFields(rowNode, true); 
+                partionIngester.addStatement(deleteRowQuery);
+                logger.debug("RECORDDELETE : " + deleteRowQuery);
             }
         }
         catch (IOException e)
@@ -391,17 +396,10 @@ public final class CosmosDbTransformer
             else 
             {
             	ObjectNode cellNode = rowNode.putObject(colName); // create a cell node to attach to row.
-            	//StringBuilder sb = new StringBuilder();    	
-            	//sb.append("{");
 	            for (Cell subCell : complexData)
 	            {
-	            	String celName = subCell.column().name.toCQLString();
-	                String celVal = serializeCell(subCell, liveInfo, cellNode);
-	                //sb.append(sb.length()>1? "," : "");
-	                //sb.append("\""+celName+"\" : "+ celVal);
+	                serializeCell(subCell, liveInfo, cellNode);
 	            }	            
-            	// sb.append("}");
-	            // return sb.toString();
 	            String jsonValStr = objMapper.writerWithDefaultPrettyPrinter().writeValueAsString(cellNode);
 	            return jsonValStr;
             }
@@ -412,7 +410,7 @@ public final class CosmosDbTransformer
     private String serializeCell(Cell cell, LivenessInfo liveInfo, ObjectNode rowNode) 
     		throws JsonGenerationException, JsonMappingException, IOException 
     {
-        String cellValue = null;
+        String cellValue = null; // cell JSON value.
     	ColumnDefinition cdef = cell.column();
         AbstractType<?> type = cdef.type;
         AbstractType<?> cellType = null;
@@ -455,14 +453,6 @@ public final class CosmosDbTransformer
         {
         	cellValue = " null "; // cql and json value of null
         	rowNode.putNull(colName);
-        	//NOCOSMOSDBSUPPORT:
-            //json.writeFieldName("deletion_info");
-            //objectIndenter.setCompact(true);
-            //json.writeStartObject();
-            //json.writeFieldName("local_delete_time");
-            //json.writeString(dateString(TimeUnit.SECONDS, cell.localDeletionTime()));
-            //json.writeEndObject();
-            //objectIndenter.setCompact(false);
         }
         else
         {
