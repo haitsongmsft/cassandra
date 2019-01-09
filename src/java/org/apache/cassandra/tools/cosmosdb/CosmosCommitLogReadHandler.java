@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 
 public class CosmosCommitLogReadHandler implements CommitLogReadHandler {
 
@@ -29,23 +28,12 @@ public class CosmosCommitLogReadHandler implements CommitLogReadHandler {
 
     private final String keyspace;
     private final String table;
-    private final String topic;
 
-    //xx private final Producer<String, String> producer;
-
-    public CosmosCommitLogReadHandler(Map<String, Object> configuration) {
-
-        keyspace = (String) YamlUtils.select(configuration, "cassandra.keyspace");
-
-        table = (String) YamlUtils.select(configuration, "cassandra.table");
-
-        topic = (String) YamlUtils.select(configuration, "kafka.topic");
-
-        //xx producer = new KafkaProducer<>((Map) YamlUtils.select(configuration, "kafka.configuration"));
-
+    public CosmosCommitLogReadHandler(String keyspace, String table) 
+    {
+    	this.keyspace = keyspace;
+    	this.table = table;
     }
-
-
 
     @Override
     public void handleMutation(Mutation mutation, int size, int entryLocation, CommitLogDescriptor descriptor) {
@@ -56,8 +44,6 @@ public class CosmosCommitLogReadHandler implements CommitLogReadHandler {
         logger.debug("Handle mutation finished...");
     }
 
-
-
     @Override
     public void handleUnrecoverableError(CommitLogReadException exception) throws IOException {
         logger.debug("Handle unrecoverable error called.");
@@ -65,7 +51,6 @@ public class CosmosCommitLogReadHandler implements CommitLogReadHandler {
     }
 
     @Override
-
     public boolean shouldSkipSegmentOnError(CommitLogReadException exception) throws IOException {
         logger.debug("Should skip segment on error.");
         exception.printStackTrace();
@@ -152,30 +137,18 @@ public class CosmosCommitLogReadHandler implements CommitLogReadHandler {
         }
 
         logger.debug("Creating json value...");
-
         String value = obj.toJSONString();
-
         logger.debug("Created json value '{}'", value);
-
         //ProducerRecord<String, String> record = new ProducerRecord<>(topic, key, value);
-
-        logger.debug("Created producer record with topic {}, key {}, value {}", topic, key, value);
-
         //producer.send(record);
-
         logger.debug("Sent record to kafka.");
-
     }
-
-
 
     private boolean partitionIsDeleted(Partition partition) {
 
         return partition.partitionLevelDeletion().markedForDeleteAt() > Long.MIN_VALUE;
 
     }
-
-
 
     private boolean rowIsDeleted(Row row) 
     {

@@ -2054,13 +2054,17 @@ public class DatabaseDescriptor
 
     public static int getFileCacheSizeInMB()
     {
-        if (conf.file_cache_size_in_mb == null)
+    	if( conf == null )
+    	{
+    		// default to 512 MB if no configuration, for running commitlog reader outside of cassandra node
+    		return 512; 
+    	}
+    	else if (conf.file_cache_size_in_mb == null)
         {
             // In client mode the value is not set.
             assert DatabaseDescriptor.isClientInitialized();
             return 0;
         }
-
         return conf.file_cache_size_in_mb;
     }
 
@@ -2078,7 +2082,7 @@ public class DatabaseDescriptor
 
     public static boolean getBufferPoolUseHeapIfExhausted()
     {
-        return conf.buffer_pool_use_heap_if_exhausted;
+        return conf == null ? true: conf.buffer_pool_use_heap_if_exhausted;
     }
 
     public static DiskOptimizationStrategy getDiskOptimizationStrategy()

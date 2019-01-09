@@ -308,8 +308,8 @@ public class CommitLogReader
         while (statusTracker.shouldContinue() && reader.getFilePointer() < end && !reader.isEOF())
         {
             long mutationStart = reader.getFilePointer();
-            if (logger.isTraceEnabled())
-                logger.trace("Reading mutation at {}", mutationStart);
+            //if (logger.isTraceEnabled())
+            logger.debug("Reading mutation at {}", mutationStart);
 
             long claimedCRC32;
             int serializedSize;

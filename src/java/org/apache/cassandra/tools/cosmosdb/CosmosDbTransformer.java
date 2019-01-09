@@ -25,6 +25,8 @@ import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -59,6 +61,8 @@ import org.slf4j.LoggerFactory;
 public final class CosmosDbTransformer
 {
 
+	private static final int NPOOLTHREADS = 4; // thread pool size for the ingest executor
+	
     private static final Logger logger = LoggerFactory.getLogger(CosmosDbTransformer.class);
     
 	private static ObjectMapper objMapper = new ObjectMapper();
@@ -78,6 +82,7 @@ public final class CosmosDbTransformer
         this.rawTime = rawTime;
     }
     
+    private static ExecutorService executor;  
     public static void IngestToCosmosDb(
     		ISSTableScanner currentScanner, 
     		Stream<UnfilteredRowIterator> partitions, 
@@ -85,6 +90,7 @@ public final class CosmosDbTransformer
     		CFMetaData metadata)
             throws IOException, InterruptedException
     {
+        executor = Executors.newFixedThreadPool(NPOOLTHREADS);    	
         CosmosDbTransformer transformer = new CosmosDbTransformer(currentScanner, rawTime, metadata);
         partitions.forEach(part ->{
         	try 
@@ -96,7 +102,10 @@ public final class CosmosDbTransformer
         		// eat exception;
         	}
         });
-        CosmosIngester.Close();    	
+        executor.shutdown();
+        executor.awaitTermination(60, TimeUnit.MINUTES);
+        executor.shutdownNow();
+        CosmosIngester.Close();
     	logger.info("Ingest of table " + metadata.cfName+ " finished ");
     }
 
@@ -175,17 +184,13 @@ public final class CosmosDbTransformer
 
     private void serializePartition(UnfilteredRowIterator partition) throws InterruptedException 
     {
-    	CosmosIngester partionIngester = null;
-    	Thread partionIngThread = null;
+    	CosmosIngester partionIngester = new CosmosIngester();
         try
         {           	
             String tableName = metadata.ksName + "." + metadata.cfName;
             ObjectNode partitionKeyNode = objMapper.createObjectNode();            
             serializePartitionKey(partition.partitionKey(), partitionKeyNode);
-
-            partionIngester = CosmosIngester.GetInstance();
-            partionIngThread = new Thread(partionIngester);
-            partionIngThread.start();
+            executor.execute(partionIngester);
                                                            
             if (!partition.partitionLevelDeletion().isLive()) 
             {
@@ -240,12 +245,7 @@ public final class CosmosDbTransformer
         }
         finally
         {
-            if(partionIngester!=null) 
-            {
-                partionIngester.end();
-                partionIngThread.join();
-    		    CosmosIngester.SaveInstance(partionIngester);
-            }
+            partionIngester.end();
         }
     }
 

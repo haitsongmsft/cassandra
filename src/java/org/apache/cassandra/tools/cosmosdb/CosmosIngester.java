@@ -12,6 +12,8 @@ import java.security.*;
 import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.apache.cassandra.config.EncryptionOptions;
 import org.codehaus.jackson.JsonNode;
@@ -27,9 +29,9 @@ public class CosmosIngester implements Runnable
     private static final Logger logger = LoggerFactory.getLogger(CosmosIngester.class);
 	private static final int RETRYINTERVAL = 2000; // miliseconds;
 	private static final int MAXRETRIES = 3;
-	private static final int NTHREADS = 4;
+	private static final int NSESSIONS = 4;
     private static BlockingQueue<Session> connectSession = null;
-    private static BlockingQueue<CosmosIngester> ingesters = null;
+    // private static BlockingQueue<CosmosIngester> ingesters = null;
     private static Cluster cluster =  null;
     private static CosmosDbConfiguration config = new CosmosDbConfiguration();    
     
@@ -61,8 +63,8 @@ public class CosmosIngester implements Runnable
             String pass = config.getProperty("cassandra_password");
             String sslpath = config.getProperty("ssl_keystore_file_path");
             String sslpass = config.getProperty("ssl_keystore_password");
-            connectSession = new ArrayBlockingQueue<Session>(NTHREADS);
-    		for(int i=0; i<NTHREADS; i++) 
+            connectSession = new ArrayBlockingQueue<Session>(NSESSIONS);
+    		for(int i=0; i<NSESSIONS; i++) 
     		{
     			Session s = getCosmosDbSession(host, port, user, pass, sslpath,sslpass); 
     			connectSession.add(s);
@@ -71,6 +73,7 @@ public class CosmosIngester implements Runnable
 		return connectSession.take();
     }
     
+    /*
     public static CosmosIngester GetInstance() throws InterruptedException
     {
     	CosmosIngester inj = null;
@@ -95,6 +98,7 @@ public class CosmosIngester implements Runnable
     	if(ing==null) return false;
     	return ingesters.add(ing);
     }
+    */
     
     private static boolean SaveSession(Session s)
     {
